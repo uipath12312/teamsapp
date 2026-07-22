@@ -87,6 +87,13 @@ export default function MeetingPage() {
           </div>
         </header>
 
+        {/* Media info notice (soft — not an error) */}
+        {meeting.mediaInfo && !meeting.error && (
+          <div className="border-b border-amber-400/20 bg-amber-500/10 px-4 py-2 text-sm text-amber-200">
+            ℹ {meeting.mediaInfo}
+          </div>
+        )}
+
         {/* Error banner */}
         {meeting.error && (
           <div className="border-b border-red-400/30 bg-red-500/10 px-4 py-2 text-sm text-red-200">

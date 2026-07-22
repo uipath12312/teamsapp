@@ -16,8 +16,6 @@ type SignalPayload = {
   candidate?: RTCIceCandidateInit;
 };
 
-// ICE servers: Google STUN + free Metered TURN servers
-// Free TURN via Open Relay Project (no signup needed, rate-limited but works for small meetings)
 const rtcConfig: RTCConfiguration = {
   iceServers: [
     { urls: "stun:stun.l.google.com:19302" },
@@ -25,50 +23,73 @@ const rtcConfig: RTCConfiguration = {
     { urls: "stun:stun2.l.google.com:19302" },
     { urls: "stun:stun3.l.google.com:19302" },
     { urls: "stun:stun4.l.google.com:19302" },
-    // Free TURN — Open Relay Project (openrelay.metered.ca)
-    {
-      urls: "turn:openrelay.metered.ca:80",
-      username: "openrelayproject",
-      credential: "openrelayproject",
-    },
-    {
-      urls: "turn:openrelay.metered.ca:443",
-      username: "openrelayproject",
-      credential: "openrelayproject",
-    },
-    {
-      urls: "turn:openrelay.metered.ca:443?transport=tcp",
-      username: "openrelayproject",
-      credential: "openrelayproject",
-    },
+    { urls: "turn:openrelay.metered.ca:80",    username: "openrelayproject", credential: "openrelayproject" },
+    { urls: "turn:openrelay.metered.ca:443",   username: "openrelayproject", credential: "openrelayproject" },
+    { urls: "turn:openrelay.metered.ca:443?transport=tcp", username: "openrelayproject", credential: "openrelayproject" },
   ],
   iceCandidatePoolSize: 10,
 };
 
+/**
+ * Try to get camera+mic, fall back gracefully so the meeting is NEVER blocked.
+ * Returns: { stream, hasVideo, hasAudio }
+ */
+async function acquireMedia(): Promise<{ stream: MediaStream; hasVideo: boolean; hasAudio: boolean }> {
+  // Attempt 1: camera + microphone
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: "user" },
+    });
+    console.log("[Media] Camera + microphone granted.");
+    return { stream, hasVideo: true, hasAudio: true };
+  } catch (e1) {
+    console.warn("[Media] Camera+mic failed:", (e1 as Error).name, "— trying audio only");
+  }
+
+  // Attempt 2: microphone only
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+    console.log("[Media] Microphone-only granted.");
+    return { stream, hasVideo: false, hasAudio: true };
+  } catch (e2) {
+    console.warn("[Media] Audio-only failed:", (e2 as Error).name, "— trying video only");
+  }
+
+  // Attempt 3: camera only
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: false, video: true });
+    console.log("[Media] Camera-only granted.");
+    return { stream, hasVideo: true, hasAudio: false };
+  } catch (e3) {
+    console.warn("[Media] Video-only failed:", (e3 as Error).name, "— joining with no media");
+  }
+
+  // Attempt 4: no media — join anyway with empty stream
+  console.warn("[Media] No media available. Joining meeting without camera or microphone.");
+  return { stream: new MediaStream(), hasVideo: false, hasAudio: false };
+}
+
 export function useMeeting({ meetingId, displayName, isHostIntent }: Options) {
   const router = useRouter();
 
-  // ── stable refs ───────────────────────────────────────────────────────────
   const socketRef = useRef<Socket | null>(null);
   const peersRef = useRef<Map<string, RTCPeerConnection>>(new Map());
-  // Per-peer MediaStream accumulator — we build the remote stream here and push to state
   const remoteStreamsRef = useRef<Map<string, MediaStream>>(new Map());
   const localStreamRef = useRef<MediaStream | null>(null);
   const screenStreamRef = useRef<MediaStream | null>(null);
   const recorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<BlobPart[]>([]);
-  const startTimeRef = useRef(0);
   const iceCandidateQueueRef = useRef<Map<string, RTCIceCandidateInit[]>>(new Map());
   const initRunningRef = useRef(false);
 
-  // ── react state ───────────────────────────────────────────────────────────
   const [localStream, setLocalStream] = useState<MediaStream | null>(null);
   const [participants, setParticipants] = useState<Participant[]>([]);
   const [localParticipant, setLocalParticipant] = useState<Participant | null>(null);
   const [remoteStreams, setRemoteStreams] = useState<RemoteStream[]>([]);
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
-  const [micOn, setMicOn] = useState(true);
-  const [cameraOn, setCameraOn] = useState(true);
+  const [micOn, setMicOn] = useState(false);
+  const [cameraOn, setCameraOn] = useState(false);
   const [isSharingScreen, setIsSharingScreen] = useState(false);
   const [screenShareParticipantId, setScreenShareParticipantId] = useState<string | null>(null);
   const [isRecording, setIsRecording] = useState(false);
@@ -76,14 +97,13 @@ export function useMeeting({ meetingId, displayName, isHostIntent }: Options) {
   const [handRaised, setHandRaised] = useState(false);
   const [timer, setTimer] = useState("00:00");
   const [error, setError] = useState("");
+  const [mediaInfo, setMediaInfo] = useState("");
   const [connectionStatus, setConnectionStatus] = useState<"connecting" | "connected" | "failed">("connecting");
 
   const signalingUrl = useMemo(
     () => process.env.NEXT_PUBLIC_SIGNALING_URL || "http://localhost:4000",
     []
   );
-
-  // ── peer helpers ──────────────────────────────────────────────────────────
 
   const cleanupPeer = useCallback((participantId: string) => {
     console.log("[WebRTC] Cleaning up peer:", participantId);
@@ -94,15 +114,32 @@ export function useMeeting({ meetingId, displayName, isHostIntent }: Options) {
     setRemoteStreams((s) => s.filter((r) => r.participantId !== participantId));
   }, []);
 
-  const replaceVideoTrack = useCallback((track: MediaStreamTrack | null) => {
-    peersRef.current.forEach((peer, id) => {
-      const sender = peer.getSenders().find((s) => s.track?.kind === "video");
-      if (sender && track) {
-        sender.replaceTrack(track).catch((e) =>
-          console.error("[WebRTC] replaceTrack failed for", id, e)
-        );
+  /**
+   * Replace a track kind (video or audio) in ALL active peer connections.
+   * Pass null to clear the sender track (mute without stopping hardware).
+   * Pass a track to replace (used for camera on/off and screen share).
+   */
+  const replaceTrackInPeers = useCallback(async (kind: "video" | "audio", track: MediaStreamTrack | null) => {
+    const promises = Array.from(peersRef.current.entries()).map(async ([id, peer]) => {
+      const sender = peer.getSenders().find((s) => s.track?.kind === kind || (track && s.track === null && kind === "video"));
+      if (sender) {
+        try {
+          await sender.replaceTrack(track);
+          console.log(`[WebRTC] Replaced ${kind} track in peer ${id}`);
+        } catch (e) {
+          console.error(`[WebRTC] replaceTrack(${kind}) failed for ${id}:`, e);
+        }
+      } else if (track && localStreamRef.current) {
+        // No sender for this kind yet — add a new track
+        try {
+          peer.addTrack(track, localStreamRef.current);
+          console.log(`[WebRTC] Added new ${kind} track to peer ${id}`);
+        } catch (e) {
+          console.error(`[WebRTC] addTrack(${kind}) failed for ${id}:`, e);
+        }
       }
     });
+    await Promise.all(promises);
   }, []);
 
   const flushIceQueue = useCallback(async (participantId: string, peer: RTCPeerConnection) => {
@@ -110,153 +147,96 @@ export function useMeeting({ meetingId, displayName, isHostIntent }: Options) {
     if (!queue?.length) return;
     console.log(`[WebRTC] Flushing ${queue.length} queued ICE candidates for`, participantId);
     for (const candidate of queue) {
-      try {
-        await peer.addIceCandidate(candidate);
-      } catch (e) {
-        console.error("[WebRTC] Failed to add queued ICE candidate:", e);
-      }
+      try { await peer.addIceCandidate(candidate); } catch (e) { console.error("[WebRTC] queued ICE failed:", e); }
     }
     iceCandidateQueueRef.current.delete(participantId);
   }, []);
 
-  const createPeer = useCallback(
-    (participantId: string): RTCPeerConnection => {
-      const existing = peersRef.current.get(participantId);
-      if (existing) return existing;
+  const createPeer = useCallback((participantId: string): RTCPeerConnection => {
+    const existing = peersRef.current.get(participantId);
+    if (existing) return existing;
 
-      console.log("[WebRTC] Creating peer connection to:", participantId);
-      const socket = socketRef.current;
-      const peer = new RTCPeerConnection(rtcConfig);
-      peersRef.current.set(participantId, peer);
+    console.log("[WebRTC] Creating peer:", participantId);
+    const socket = socketRef.current;
+    const peer = new RTCPeerConnection(rtcConfig);
+    peersRef.current.set(participantId, peer);
 
-      // Create a MediaStream for this participant upfront
-      // All incoming tracks will be added to this same stream object
-      const remoteStream = new MediaStream();
-      remoteStreamsRef.current.set(participantId, remoteStream);
+    const remoteStream = new MediaStream();
+    remoteStreamsRef.current.set(participantId, remoteStream);
 
-      // Add local tracks to the peer
-      if (localStreamRef.current) {
-        localStreamRef.current.getTracks().forEach((track) => {
-          console.log("[WebRTC] Adding local track:", track.kind, "to peer:", participantId);
-          peer.addTrack(track, localStreamRef.current!);
-        });
-      } else {
-        console.warn("[WebRTC] No local stream when creating peer for", participantId);
+    // Add local tracks (may be empty if user has no media)
+    if (localStreamRef.current) {
+      localStreamRef.current.getTracks().forEach((track) => {
+        console.log("[WebRTC] Adding local track:", track.kind, "to peer:", participantId);
+        peer.addTrack(track, localStreamRef.current!);
+      });
+    }
+
+    peer.onicecandidate = (event) => {
+      if (event.candidate && socket) {
+        socket.emit("signal:ice-candidate", { to: participantId, candidate: event.candidate });
       }
+    };
 
-      peer.onicecandidate = (event) => {
-        if (event.candidate && socket) {
-          console.log("[WebRTC] ICE candidate generated for:", participantId, event.candidate.type);
-          socket.emit("signal:ice-candidate", {
-            to: participantId,
-            candidate: event.candidate,
-          });
-        } else if (!event.candidate) {
-          console.log("[WebRTC] ICE gathering complete for:", participantId);
-        }
-      };
+    peer.onicegatheringstatechange = () => {
+      console.log("[WebRTC] ICE gathering:", participantId, peer.iceGatheringState);
+    };
 
-      peer.onicegatheringstatechange = () => {
-        console.log("[WebRTC] ICE gathering state for", participantId, ":", peer.iceGatheringState);
-      };
+    peer.oniceconnectionstatechange = () => {
+      console.log("[WebRTC] ICE connection:", participantId, peer.iceConnectionState);
+      if (peer.iceConnectionState === "failed") {
+        console.warn("[WebRTC] ICE failed — restarting:", participantId);
+        peer.restartIce();
+      }
+    };
 
-      peer.oniceconnectionstatechange = () => {
-        console.log("[WebRTC] ICE connection state for", participantId, ":", peer.iceConnectionState);
-        if (peer.iceConnectionState === "failed") {
-          console.error("[WebRTC] ICE failed for", participantId, "— attempting restart");
-          peer.restartIce();
-        }
-      };
+    peer.onconnectionstatechange = () => {
+      console.log("[WebRTC] Connection state:", participantId, peer.connectionState);
+      if (peer.connectionState === "failed" || peer.connectionState === "closed") {
+        cleanupPeer(participantId);
+      }
+    };
 
-      peer.onconnectionstatechange = () => {
-        console.log("[WebRTC] Connection state for", participantId, ":", peer.connectionState);
-        // Only clean up on truly terminal states — NOT on "disconnected" which is transient
-        if (peer.connectionState === "failed" || peer.connectionState === "closed") {
-          console.error("[WebRTC] Peer connection permanently failed for:", participantId);
-          cleanupPeer(participantId);
-        }
-      };
+    peer.onsignalingstatechange = () => {
+      console.log("[WebRTC] Signaling state:", participantId, peer.signalingState);
+    };
 
-      peer.onsignalingstatechange = () => {
-        console.log("[WebRTC] Signaling state for", participantId, ":", peer.signalingState);
-      };
-
-      // BUG FIX: Use a single pre-created MediaStream and add all tracks to it.
-      // This correctly handles audio + video arriving in separate ontrack events.
-      peer.ontrack = (event) => {
-        console.log(
-          "[WebRTC] ontrack from:", participantId,
-          "kind:", event.track.kind,
-          "streams:", event.streams.length,
-          "track.id:", event.track.id
-        );
-
-        // Always add the track to our per-participant MediaStream accumulator
-        const stream = remoteStreamsRef.current.get(participantId)!;
-
-        // Check if this track kind is already in the stream — replace if so
-        const existingTrack = stream.getTracks().find((t) => t.kind === event.track.kind);
-        if (existingTrack) {
-          stream.removeTrack(existingTrack);
-          console.log("[WebRTC] Replaced existing", event.track.kind, "track for:", participantId);
-        }
-        stream.addTrack(event.track);
-        console.log(
-          "[WebRTC] Stream for", participantId,
-          "now has tracks:", stream.getTracks().map((t) => t.kind)
-        );
-
-        // Update React state — always replace the entry so VideoTile re-renders
+    peer.ontrack = (event) => {
+      console.log("[WebRTC] ontrack from:", participantId, "kind:", event.track.kind);
+      const stream = remoteStreamsRef.current.get(participantId)!;
+      const existing = stream.getTracks().find((t) => t.kind === event.track.kind);
+      if (existing) stream.removeTrack(existing);
+      stream.addTrack(event.track);
+      console.log("[WebRTC] Remote stream tracks:", stream.getTracks().map((t) => t.kind));
+      setRemoteStreams((prev) => {
+        const next = prev.filter((r) => r.participantId !== participantId);
+        return [...next, { participantId, stream }];
+      });
+      event.track.onunmute = () => {
         setRemoteStreams((prev) => {
           const next = prev.filter((r) => r.participantId !== participantId);
           return [...next, { participantId, stream }];
         });
-
-        // Handle track ending (e.g. participant mutes camera)
-        event.track.onended = () => {
-          console.log("[WebRTC] Remote track ended:", event.track.kind, "from:", participantId);
-        };
-        event.track.onmute = () => {
-          console.log("[WebRTC] Remote track muted:", event.track.kind, "from:", participantId);
-        };
-        event.track.onunmute = () => {
-          console.log("[WebRTC] Remote track unmuted:", event.track.kind, "from:", participantId);
-          // Force a state update so VideoTile picks up the unmuted track
-          setRemoteStreams((prev) => {
-            const next = prev.filter((r) => r.participantId !== participantId);
-            return [...next, { participantId, stream }];
-          });
-        };
       };
+    };
 
-      return peer;
-    },
-    [cleanupPeer]
-  );
+    return peer;
+  }, [cleanupPeer]);
 
-  const callParticipant = useCallback(
-    async (participantId: string) => {
-      const socket = socketRef.current;
-      if (!socket) {
-        console.warn("[WebRTC] Cannot call: no socket");
-        return;
-      }
-      console.log("[WebRTC] Calling (making offer to):", participantId);
-      const peer = createPeer(participantId);
-      try {
-        const offer = await peer.createOffer({
-          offerToReceiveAudio: true,
-          offerToReceiveVideo: true,
-        });
-        await peer.setLocalDescription(offer);
-        socket.emit("signal:offer", { to: participantId, description: offer });
-        console.log("[WebRTC] Offer sent to:", participantId);
-      } catch (e) {
-        console.error("[WebRTC] createOffer failed for:", participantId, e);
-      }
-    },
-    [createPeer]
-  );
+  const callParticipant = useCallback(async (participantId: string) => {
+    const socket = socketRef.current;
+    if (!socket) return;
+    console.log("[WebRTC] Calling:", participantId);
+    const peer = createPeer(participantId);
+    try {
+      const offer = await peer.createOffer({ offerToReceiveAudio: true, offerToReceiveVideo: true });
+      await peer.setLocalDescription(offer);
+      socket.emit("signal:offer", { to: participantId, description: offer });
+      console.log("[WebRTC] Offer sent to:", participantId);
+    } catch (e) {
+      console.error("[WebRTC] createOffer failed:", participantId, e);
+    }
+  }, [createPeer]);
 
   // ── main init effect ──────────────────────────────────────────────────────
 
@@ -264,49 +244,26 @@ export function useMeeting({ meetingId, displayName, isHostIntent }: Options) {
     if (!meetingId || !displayName) return;
     if (initRunningRef.current) return;
     initRunningRef.current = true;
-
     let cancelled = false;
 
     async function init() {
-      // 1. Get local media
-      let media: MediaStream;
-      try {
-        console.log("[Media] Requesting camera + microphone…");
-        media = await navigator.mediaDevices.getUserMedia({
-          audio: {
-            echoCancellation: true,
-            noiseSuppression: true,
-            autoGainControl: true,
-          },
-          video: {
-            width: { ideal: 1280 },
-            height: { ideal: 720 },
-            facingMode: "user",
-          },
-        });
-        console.log("[Media] Granted:", media.getTracks().map((t) => `${t.kind}:${t.label}`));
-      } catch (err: unknown) {
-        initRunningRef.current = false;
-        const name = err instanceof Error ? err.name : String(err);
-        console.error("[Media] getUserMedia failed:", name, err);
-        if (name === "NotAllowedError" || name === "PermissionDeniedError") {
-          setError("Camera or microphone permission was denied. Please allow access in your browser settings and refresh.");
-        } else if (name === "NotFoundError" || name === "DevicesNotFoundError") {
-          setError("No camera or microphone found. Please connect a device and refresh.");
-        } else if (name === "NotReadableError" || name === "TrackStartError") {
-          setError("Camera or microphone is already in use by another application.");
-        } else {
-          setError(`Could not access camera/microphone: ${name}`);
-        }
-        return;
+      // TASK 15: Never block the meeting — always join even with no media
+      const { stream, hasVideo, hasAudio } = await acquireMedia();
+      if (cancelled) { stream.getTracks().forEach((t) => t.stop()); return; }
+
+      localStreamRef.current = stream;
+      setLocalStream(stream);
+      setMicOn(hasAudio);
+      setCameraOn(hasVideo);
+
+      if (!hasVideo && !hasAudio) {
+        setMediaInfo("Joined without camera or microphone. You can still chat and share your screen.");
+      } else if (!hasVideo) {
+        setMediaInfo("Camera unavailable. Joined with microphone only.");
+      } else if (!hasAudio) {
+        setMediaInfo("Microphone unavailable. Joined with camera only.");
       }
 
-      if (cancelled) { media.getTracks().forEach((t) => t.stop()); return; }
-      localStreamRef.current = media;
-      setLocalStream(media);
-      console.log("[Media] Local stream ready.");
-
-      // 2. Connect Socket.IO
       console.log("[Socket] Connecting to:", signalingUrl);
       const socket = io(signalingUrl, {
         transports: ["websocket", "polling"],
@@ -321,7 +278,6 @@ export function useMeeting({ meetingId, displayName, isHostIntent }: Options) {
         console.log("[Socket] Connected. ID:", socket.id);
         setConnectionStatus("connected");
         setError("");
-
         socket.emit(
           "meeting:join",
           { meetingId, name: displayName, createAsHost: isHostIntent },
@@ -329,19 +285,12 @@ export function useMeeting({ meetingId, displayName, isHostIntent }: Options) {
             if (cancelled) return;
             console.log("[Socket] meeting:join ack:", JSON.stringify(result));
             if (!result.ok) {
-              const msg =
-                result.reason === "ROOM_FULL"
-                  ? "This meeting is full."
-                  : result.reason === "ENDED"
-                  ? "This meeting has ended."
-                  : "Unable to join. Please try again.";
-              setError(msg);
+              setError(result.reason === "ROOM_FULL" ? "This meeting is full." : result.reason === "ENDED" ? "This meeting has ended." : "Unable to join. Please try again.");
               return;
             }
             setLocalParticipant(result.participant ?? null);
             setParticipants(result.participants ?? []);
-            startTimeRef.current = Date.now();
-            console.log("[Meeting] Joined. Room participants:", result.participants?.map((p) => p.name));
+            console.log("[Meeting] Joined. Participants:", result.participants?.map((p) => p.name));
           }
         );
       });
@@ -354,78 +303,36 @@ export function useMeeting({ meetingId, displayName, isHostIntent }: Options) {
 
       socket.on("disconnect", (reason) => {
         console.warn("[Socket] Disconnected:", reason);
-        if (reason !== "io client disconnect") {
-          setError("Disconnected. Attempting to reconnect…");
-        }
+        if (reason !== "io client disconnect") setError("Disconnected. Attempting to reconnect…");
       });
 
-      socket.on("reconnect", (attempt) => {
-        console.log("[Socket] Reconnected after", attempt, "attempts.");
-        setError("");
-      });
-
-      // Meeting events
-      socket.on("meeting:participants", (items: Participant[]) => {
-        console.log("[Meeting] Participant list update:", items.map((p) => p.name));
-        setParticipants(items);
-      });
-
-      socket.on("meeting:ended", () => {
-        setError("The host ended this meeting.");
-        setTimeout(() => router.replace("/"), 1500);
-      });
+      socket.on("reconnect", (attempt) => { console.log("[Socket] Reconnected after", attempt, "attempts."); setError(""); });
+      socket.on("meeting:participants", (items: Participant[]) => { setParticipants(items); });
+      socket.on("meeting:ended", () => { setError("The host ended this meeting."); setTimeout(() => router.replace("/"), 1500); });
 
       socket.on("participant:joined", (participant: Participant) => {
-        console.log("[Meeting] New participant joined:", participant.name, participant.id);
+        console.log("[Meeting] Participant joined:", participant.name);
         setParticipants((prev) => upsertParticipant(prev, participant));
-        // We (existing user) call the new participant
-        callParticipant(participant.id).catch((e) =>
-          console.error("[WebRTC] callParticipant error:", e)
-        );
+        callParticipant(participant.id).catch((e) => console.error("[WebRTC] callParticipant error:", e));
       });
 
       socket.on("participant:left", ({ participantId }: { participantId: string }) => {
-        console.log("[Meeting] Participant left:", participantId);
         setParticipants((prev) => prev.filter((p) => p.id !== participantId));
         cleanupPeer(participantId);
         setScreenShareParticipantId((id) => (id === participantId ? null : id));
       });
 
-      socket.on("participant:removed", () => {
-        setError("You were removed from the meeting.");
-        setTimeout(() => router.replace("/"), 1200);
-      });
-
+      socket.on("participant:removed", () => { setError("You were removed."); setTimeout(() => router.replace("/"), 1200); });
       socket.on("participant:state", (participant: Participant) => {
         setParticipants((prev) => upsertParticipant(prev, participant));
-        if (participant.id === socket.id) {
-          setLocalParticipant(participant);
-          setHandRaised(participant.handRaised);
-        }
+        if (participant.id === socket.id) { setLocalParticipant(participant); setHandRaised(participant.handRaised); }
       });
+      socket.on("screen:state", ({ participantId }: { participantId: string | null }) => setScreenShareParticipantId(participantId));
+      socket.on("chat:message", (message: ChatMessage) => setChatMessages((prev) => [...prev, message]));
 
-      socket.on("screen:state", ({ participantId }: { participantId: string | null }) => {
-        setScreenShareParticipantId(participantId);
-      });
-
-      socket.on("chat:message", (message: ChatMessage) => {
-        setChatMessages((prev) => [...prev, message]);
-      });
-
-      // WebRTC signaling
       socket.on("signal:offer", async ({ from, description }: SignalPayload) => {
         if (!description) return;
-        console.log("[WebRTC] Received offer from:", from);
-
-        // Guard: wait for local stream if needed
-        if (!localStreamRef.current) {
-          console.warn("[WebRTC] Waiting for local stream before handling offer from:", from);
-          await new Promise<void>((resolve) => {
-            const t = setInterval(() => { if (localStreamRef.current) { clearInterval(t); resolve(); } }, 50);
-            setTimeout(() => { clearInterval(t); resolve(); }, 5000);
-          });
-        }
-
+        console.log("[WebRTC] Offer from:", from);
         const peer = createPeer(from);
         try {
           await peer.setRemoteDescription(new RTCSessionDescription(description));
@@ -434,49 +341,29 @@ export function useMeeting({ meetingId, displayName, isHostIntent }: Options) {
           await peer.setLocalDescription(answer);
           socket.emit("signal:answer", { to: from, description: answer });
           console.log("[WebRTC] Answer sent to:", from);
-        } catch (e) {
-          console.error("[WebRTC] Failed to handle offer from", from, ":", e);
-        }
+        } catch (e) { console.error("[WebRTC] offer handling failed:", from, e); }
       });
 
       socket.on("signal:answer", async ({ from, description }: SignalPayload) => {
         if (!description) return;
-        console.log("[WebRTC] Received answer from:", from);
         const peer = peersRef.current.get(from);
-        if (!peer) {
-          console.warn("[WebRTC] No peer found for answer from:", from);
-          return;
-        }
-        if (peer.signalingState === "stable") {
-          console.warn("[WebRTC] Peer already stable, ignoring answer from:", from);
-          return;
-        }
+        if (!peer || peer.signalingState === "stable") return;
         try {
           await peer.setRemoteDescription(new RTCSessionDescription(description));
           await flushIceQueue(from, peer);
-        } catch (e) {
-          console.error("[WebRTC] setRemoteDescription failed for answer from", from, ":", e);
-        }
+        } catch (e) { console.error("[WebRTC] answer handling failed:", from, e); }
       });
 
       socket.on("signal:ice-candidate", async ({ from, candidate }: SignalPayload) => {
         if (!candidate) return;
         const peer = peersRef.current.get(from);
-
         if (!peer || !peer.remoteDescription) {
-          // Queue it — peer or remote description not ready yet
           const queue = iceCandidateQueueRef.current.get(from) ?? [];
           queue.push(candidate);
           iceCandidateQueueRef.current.set(from, queue);
-          console.log(`[WebRTC] Queued ICE candidate from ${from} (queue size: ${queue.length})`);
           return;
         }
-
-        try {
-          await peer.addIceCandidate(new RTCIceCandidate(candidate));
-        } catch (e) {
-          console.error("[WebRTC] addIceCandidate failed from", from, ":", e);
-        }
+        try { await peer.addIceCandidate(new RTCIceCandidate(candidate)); } catch (e) { console.error("[WebRTC] addIceCandidate failed:", from, e); }
       });
     }
 
@@ -485,7 +372,6 @@ export function useMeeting({ meetingId, displayName, isHostIntent }: Options) {
     return () => {
       cancelled = true;
       initRunningRef.current = false;
-      console.log("[Meeting] Cleanup triggered.");
       socketRef.current?.disconnect();
       socketRef.current = null;
       peersRef.current.forEach((peer) => peer.close());
@@ -504,9 +390,9 @@ export function useMeeting({ meetingId, displayName, isHostIntent }: Options) {
 
   useEffect(() => {
     if (!localParticipant) return;
-    startTimeRef.current = Date.now();
+    const start = Date.now();
     const interval = window.setInterval(() => {
-      const seconds = Math.floor((Date.now() - startTimeRef.current) / 1000);
+      const seconds = Math.floor((Date.now() - start) / 1000);
       const mins = Math.floor(seconds / 60).toString().padStart(2, "0");
       const secs = (seconds % 60).toString().padStart(2, "0");
       setTimer(`${mins}:${secs}`);
@@ -527,11 +413,43 @@ export function useMeeting({ meetingId, displayName, isHostIntent }: Options) {
     emitState({ micOn: next });
   }
 
-  function toggleCamera() {
-    const next = !cameraOn;
-    localStreamRef.current?.getVideoTracks().forEach((t) => (t.enabled = next));
-    setCameraOn(next);
-    emitState({ cameraOn: next });
+  // TASK 16: Camera off = stop() the track to release hardware light.
+  // Camera on = getUserMedia again then replaceTrack in all peers.
+  async function toggleCamera() {
+    if (cameraOn) {
+      // Turn OFF — stop the track so the OS indicator light goes off
+      const tracks = localStreamRef.current?.getVideoTracks() ?? [];
+      tracks.forEach((t) => { t.stop(); localStreamRef.current?.removeTrack(t); });
+      await replaceTrackInPeers("video", null);
+      setCameraOn(false);
+      emitState({ cameraOn: false });
+      // Update localStream state so VideoTile shows avatar
+      setLocalStream(localStreamRef.current ? new MediaStream(localStreamRef.current.getTracks()) : null);
+      console.log("[Camera] Turned OFF — hardware released.");
+    } else {
+      // Turn ON — request camera again
+      try {
+        const newStream = await navigator.mediaDevices.getUserMedia({
+          video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: "user" },
+          audio: false,
+        });
+        const [videoTrack] = newStream.getVideoTracks();
+        // Add to local stream
+        if (!localStreamRef.current) localStreamRef.current = new MediaStream();
+        // Remove any old video tracks first
+        localStreamRef.current.getVideoTracks().forEach((t) => { t.stop(); localStreamRef.current!.removeTrack(t); });
+        localStreamRef.current.addTrack(videoTrack);
+        await replaceTrackInPeers("video", videoTrack);
+        setCameraOn(true);
+        emitState({ cameraOn: true });
+        // Refresh localStream reference so VideoTile re-renders
+        setLocalStream(new MediaStream(localStreamRef.current.getTracks()));
+        console.log("[Camera] Turned ON — new stream acquired.");
+      } catch (e) {
+        console.error("[Camera] Failed to re-acquire camera:", e);
+        setError("Could not access camera. Please check permissions.");
+      }
+    }
   }
 
   async function toggleScreenShare() {
@@ -540,7 +458,8 @@ export function useMeeting({ meetingId, displayName, isHostIntent }: Options) {
       const stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
       screenStreamRef.current = stream;
       const [screenTrack] = stream.getVideoTracks();
-      replaceVideoTrack(screenTrack);
+      // Replace video track in all peers with screen track
+      await replaceTrackInPeers("video", screenTrack);
       setIsSharingScreen(true);
       setScreenShareParticipantId(localParticipant?.id ?? null);
       socketRef.current?.emit("screen:start");
@@ -551,11 +470,12 @@ export function useMeeting({ meetingId, displayName, isHostIntent }: Options) {
     }
   }
 
-  function stopScreenShare() {
+  async function stopScreenShare() {
     screenStreamRef.current?.getTracks().forEach((t) => t.stop());
     screenStreamRef.current = null;
+    // Restore camera track (if camera is on)
     const cameraTrack = localStreamRef.current?.getVideoTracks()[0] ?? null;
-    replaceVideoTrack(cameraTrack);
+    await replaceTrackInPeers("video", cameraTrack);
     setIsSharingScreen(false);
     setScreenShareParticipantId(null);
     socketRef.current?.emit("screen:stop");
@@ -637,7 +557,7 @@ export function useMeeting({ meetingId, displayName, isHostIntent }: Options) {
   return {
     localStream, remoteStreams, participants, localParticipant, chatMessages,
     micOn, cameraOn, isSharingScreen, screenShareParticipantId,
-    isRecording, isRecordingPaused, handRaised, timer, error, networkQuality, connectionStatus,
+    isRecording, isRecordingPaused, handRaised, timer, error, mediaInfo, networkQuality, connectionStatus,
     toggleMic, toggleCamera, toggleScreenShare, sendChat,
     startRecording, pauseRecording, resumeRecording, stopRecording,
     toggleFullScreen, toggleHand, leaveMeeting, endMeeting, removeParticipant,
@@ -650,11 +570,6 @@ function upsertParticipant(participants: Participant[], participant: Participant
 }
 
 function pickRecordingMimeType(): string | undefined {
-  const options = [
-    "video/mp4;codecs=h264,aac",
-    "video/webm;codecs=vp9,opus",
-    "video/webm;codecs=vp8,opus",
-    "video/webm",
-  ];
+  const options = ["video/mp4;codecs=h264,aac", "video/webm;codecs=vp9,opus", "video/webm;codecs=vp8,opus", "video/webm"];
   return options.find((t) => MediaRecorder.isTypeSupported(t));
 }
