@@ -9,13 +9,13 @@ import { useMeeting } from "@/hooks/useMeeting";
 
 export default function MeetingPage() {
   const router = useRouter();
-  // router.query is empty on first render (Next.js hydration) — wait for it
   const [ready, setReady] = useState(false);
   const [displayName, setDisplayName] = useState("");
   const [panels, setPanels] = useState({ chat: false, people: false });
   const resolvedRef = useRef(false);
 
-  // router.isReady becomes true after hydration when query params are populated
+  // Wait until router.isReady so query params are populated, then read sessionStorage.
+  // Use router.isReady (a primitive boolean) as the dep — not the unstable `router` object.
   useEffect(() => {
     if (!router.isReady) return;
     if (resolvedRef.current) return;
@@ -28,14 +28,16 @@ export default function MeetingPage() {
     }
     setDisplayName(stored);
     setReady(true);
-  }, [router, router.isReady]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [router.isReady]); // Only re-run when isReady flips — avoids unstable router object dep
 
   const meetingId = ready ? String(router.query.id ?? "") : "";
+  // isHostIntent is safe to read here: router.isReady is true before ready becomes true
   const isHostIntent = router.query.host === "1";
 
   const meeting = useMeeting({
-    meetingId: ready ? meetingId : "",
-    displayName: ready ? displayName : "",
+    meetingId,
+    displayName,
     isHostIntent,
   });
 
@@ -63,6 +65,7 @@ export default function MeetingPage() {
         <title>{title}</title>
       </Head>
       <main className="flex h-screen flex-col overflow-hidden bg-[#0b0d12] text-white">
+        {/* Header */}
         <header className="flex h-16 shrink-0 items-center justify-between border-b border-white/10 px-4">
           <div>
             <h1 className="text-base font-semibold">{title}</h1>
@@ -79,19 +82,19 @@ export default function MeetingPage() {
               {meeting.networkQuality}
             </span>
             {meeting.localParticipant?.isHost && (
-              <span className="rounded-full bg-call/20 px-2 py-1 text-cyan-100">
-                Host
-              </span>
+              <span className="rounded-full bg-call/20 px-2 py-1 text-cyan-100">Host</span>
             )}
           </div>
         </header>
 
+        {/* Error banner */}
         {meeting.error && (
-          <div className="border-b border-red-400/30 bg-red-500/10 px-4 py-3 text-sm text-red-200">
+          <div className="border-b border-red-400/30 bg-red-500/10 px-4 py-2 text-sm text-red-200">
             ⚠ {meeting.error}
           </div>
         )}
 
+        {/* Main content */}
         <div className="flex min-h-0 flex-1">
           <section className="min-w-0 flex-1 p-3">
             <VideoGrid
@@ -102,6 +105,7 @@ export default function MeetingPage() {
               screenShareParticipantId={meeting.screenShareParticipantId}
             />
           </section>
+
           {activeSidePanel && (
             <aside className="hidden w-80 shrink-0 border-l border-white/10 bg-[#11141d] md:block">
               {panels.chat ? (
@@ -121,6 +125,7 @@ export default function MeetingPage() {
           )}
         </div>
 
+        {/* Controls */}
         <ControlBar
           meetingId={meetingId}
           isHost={Boolean(meeting.localParticipant?.isHost)}
@@ -133,9 +138,7 @@ export default function MeetingPage() {
           onToggleMic={meeting.toggleMic}
           onToggleCamera={meeting.toggleCamera}
           onToggleScreenShare={meeting.toggleScreenShare}
-          onToggleChat={() =>
-            setPanels((v) => ({ chat: !v.chat, people: false }))
-          }
+          onToggleChat={() => setPanels((v) => ({ chat: !v.chat, people: false }))}
           onToggleParticipants={() =>
             setPanels((v) => ({ chat: false, people: !v.people }))
           }

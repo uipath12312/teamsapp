@@ -36,10 +36,13 @@ export function registerMeetingSocket(io: Server) {
         return;
       }
 
+      // First person into an empty room is always host.
+      // createAsHost is only honoured if the room is brand new (no other participants yet).
+      const isFirstJoiner = meeting.participants.size === 0;
       const participant: Participant = {
         id: socket.id,
         name,
-        isHost: meeting.participants.size === 0 || (payload.createAsHost === true && meeting.hostId === socket.id),
+        isHost: isFirstJoiner,
         micOn: true,
         cameraOn: true,
         handRaised: false,

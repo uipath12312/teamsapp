@@ -27,16 +27,21 @@ const rtcConfig: RTCConfiguration = {
 
 export function useMeeting({ meetingId, displayName, isHostIntent }: Options) {
   const router = useRouter();
+
+  // ── stable refs (never cause re-renders) ──────────────────────────────────
   const socketRef = useRef<Socket | null>(null);
   const peersRef = useRef<Map<string, RTCPeerConnection>>(new Map());
   const localStreamRef = useRef<MediaStream | null>(null);
   const screenStreamRef = useRef<MediaStream | null>(null);
   const recorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<BlobPart[]>([]);
-  const startTimeRef = useRef(Date.now());
-  // track whether we have already initialised to avoid double-init in strict mode
-  const initialisedRef = useRef(false);
+  const startTimeRef = useRef(0);
+  // Queue ICE candidates that arrive before the peer's remote description is set
+  const iceCandidateQueueRef = useRef<Map<string, RTCIceCandidateInit[]>>(new Map());
+  // True while init() is running — prevents StrictMode double-invoke
+  const initRunningRef = useRef(false);
 
+  // ── react state ────────────────────────────────────────────────────────────
   const [localStream, setLocalStream] = useState<MediaStream | null>(null);
   const [participants, setParticipants] = useState<Participant[]>([]);
   const [localParticipant, setLocalParticipant] = useState<Participant | null>(null);
@@ -58,12 +63,13 @@ export function useMeeting({ meetingId, displayName, isHostIntent }: Options) {
     []
   );
 
-  // ── peer helpers ──────────────────────────────────────────────────────────
+  // ── peer helpers ───────────────────────────────────────────────────────────
 
   const cleanupPeer = useCallback((participantId: string) => {
     console.log("[WebRTC] Cleaning up peer:", participantId);
     peersRef.current.get(participantId)?.close();
     peersRef.current.delete(participantId);
+    iceCandidateQueueRef.current.delete(participantId);
     setRemoteStreams((s) => s.filter((r) => r.participantId !== participantId));
   }, []);
 
@@ -78,6 +84,28 @@ export function useMeeting({ meetingId, displayName, isHostIntent }: Options) {
     });
   }, []);
 
+  /**
+   * Flush any ICE candidates that were queued before the remote description
+   * was set on this peer.
+   */
+  const flushIceQueue = useCallback(async (participantId: string, peer: RTCPeerConnection) => {
+    const queue = iceCandidateQueueRef.current.get(participantId);
+    if (!queue?.length) return;
+    console.log(`[WebRTC] Flushing ${queue.length} queued ICE candidates for`, participantId);
+    for (const candidate of queue) {
+      try {
+        await peer.addIceCandidate(candidate);
+      } catch (e) {
+        console.error("[WebRTC] Failed to add queued ICE candidate:", e);
+      }
+    }
+    iceCandidateQueueRef.current.delete(participantId);
+  }, []);
+
+  /**
+   * Create a peer connection for a remote participant, adding local tracks.
+   * Safe to call multiple times — returns existing connection if already created.
+   */
   const createPeer = useCallback(
     (participantId: string): RTCPeerConnection => {
       const existing = peersRef.current.get(participantId);
@@ -88,11 +116,11 @@ export function useMeeting({ meetingId, displayName, isHostIntent }: Options) {
       const peer = new RTCPeerConnection(rtcConfig);
       peersRef.current.set(participantId, peer);
 
-      // Add all local tracks to the peer
+      // Add all local tracks
       if (localStreamRef.current) {
         localStreamRef.current.getTracks().forEach((track) => {
           console.log("[WebRTC] Adding local track to peer:", track.kind);
-          peer.addTrack(track, localStreamRef.current as MediaStream);
+          peer.addTrack(track, localStreamRef.current!);
         });
       } else {
         console.warn("[WebRTC] No local stream when creating peer for", participantId);
@@ -100,7 +128,6 @@ export function useMeeting({ meetingId, displayName, isHostIntent }: Options) {
 
       peer.onicecandidate = (event) => {
         if (event.candidate && socket) {
-          console.log("[WebRTC] Sending ICE candidate to:", participantId);
           socket.emit("signal:ice-candidate", {
             to: participantId,
             candidate: event.candidate,
@@ -121,7 +148,37 @@ export function useMeeting({ meetingId, displayName, isHostIntent }: Options) {
 
       peer.ontrack = (event) => {
         console.log("[WebRTC] Received remote track from:", participantId, event.track.kind);
-        const stream = event.streams[0] ?? new MediaStream([event.track]);
+        // Always use the first MediaStream from the event if available.
+        // If not, we build one and add the track — then add subsequent tracks to it.
+        let stream: MediaStream;
+        if (event.streams && event.streams[0]) {
+          stream = event.streams[0];
+        } else {
+          // Fallback: find existing remote stream for this participant and add the track,
+          // or create a new MediaStream.
+          const existing = peersRef.current.get(participantId);
+          const existingRemote = (() => {
+            // access the latest remote streams via setRemoteStreams callback trick
+            let found: MediaStream | null = null;
+            setRemoteStreams((prev) => {
+              const match = prev.find((r) => r.participantId === participantId);
+              if (match) {
+                match.stream.addTrack(event.track);
+                found = match.stream;
+              }
+              return prev; // no state change needed
+            });
+            return found;
+          })();
+          if (existingRemote) {
+            console.log("[WebRTC] Added track to existing stream for", participantId);
+            return; // stream already in state, no need to update
+          }
+          stream = new MediaStream();
+          stream.addTrack(event.track);
+          void existing; // suppress unused warning
+        }
+
         setRemoteStreams((prev) => {
           const next = prev.filter((r) => r.participantId !== participantId);
           return [...next, { participantId, stream }];
@@ -133,6 +190,10 @@ export function useMeeting({ meetingId, displayName, isHostIntent }: Options) {
     [cleanupPeer]
   );
 
+  /**
+   * Create an offer and send it to a remote participant.
+   * Called by existing participants when a new one joins.
+   */
   const callParticipant = useCallback(
     async (participantId: string) => {
       const socket = socketRef.current;
@@ -154,21 +215,22 @@ export function useMeeting({ meetingId, displayName, isHostIntent }: Options) {
     [createPeer]
   );
 
-  // ── main init effect ──────────────────────────────────────────────────────
+  // ── main init effect ───────────────────────────────────────────────────────
 
   useEffect(() => {
-    // Guard: both values must be non-empty strings
     if (!meetingId || !displayName) return;
 
-    // Prevent double-init (React StrictMode double-invokes effects in dev)
-    if (initialisedRef.current) return;
-    initialisedRef.current = true;
+    // Prevent StrictMode double-invoke: if init is already running, skip.
+    // We use a running flag rather than a "completed" flag so that the cleanup
+    // from the first StrictMode invocation correctly aborts the async work via
+    // the `cancelled` variable, and the second invocation runs cleanly.
+    if (initRunningRef.current) return;
+    initRunningRef.current = true;
 
     let cancelled = false;
-    console.log("[Meeting] Initialising. meetingId:", meetingId, "displayName:", displayName);
 
     async function init() {
-      // ── 1. Acquire local media ──────────────────────────────────────────
+      // ── 1. Acquire local media ────────────────────────────────────────────
       let media: MediaStream;
       try {
         console.log("[Media] Requesting camera + microphone…");
@@ -182,9 +244,12 @@ export function useMeeting({ meetingId, displayName, isHostIntent }: Options) {
         );
       } catch (err: unknown) {
         console.error("[Media] getUserMedia failed:", err);
+        initRunningRef.current = false;
         const name = err instanceof Error ? err.name : String(err);
         if (name === "NotAllowedError" || name === "PermissionDeniedError") {
-          setError("Camera or microphone permission was denied. Please allow access in your browser settings and refresh the page.");
+          setError(
+            "Camera or microphone permission was denied. Please allow access in your browser settings and refresh the page."
+          );
         } else if (name === "NotFoundError" || name === "DevicesNotFoundError") {
           setError("No camera or microphone found. Please connect a device and refresh.");
         } else if (name === "NotReadableError" || name === "TrackStartError") {
@@ -202,9 +267,9 @@ export function useMeeting({ meetingId, displayName, isHostIntent }: Options) {
 
       localStreamRef.current = media;
       setLocalStream(media);
-      console.log("[Media] Local stream stored and state updated.");
+      console.log("[Media] Local stream ready.");
 
-      // ── 2. Connect Socket.IO ────────────────────────────────────────────
+      // ── 2. Connect Socket.IO ──────────────────────────────────────────────
       console.log("[Socket] Connecting to:", signalingUrl);
       const socket = io(signalingUrl, {
         transports: ["websocket", "polling"],
@@ -213,17 +278,22 @@ export function useMeeting({ meetingId, displayName, isHostIntent }: Options) {
       });
       socketRef.current = socket;
 
+      // ── 3. All socket event handlers ──────────────────────────────────────
+      // Registered once here so they capture the correct socket + stream refs.
+
       socket.on("connect", () => {
+        if (cancelled) return;
         console.log("[Socket] Connected. Socket ID:", socket.id);
         setConnectionStatus("connected");
-        setError(""); // clear any previous connection error
+        setError("");
 
-        // ── 3. Join the meeting room ──────────────────────────────────────
+        // Join the meeting room immediately on connect
         console.log("[Socket] Emitting meeting:join…");
         socket.emit(
           "meeting:join",
           { meetingId, name: displayName, createAsHost: isHostIntent },
           (result: JoinResult) => {
+            if (cancelled) return;
             console.log("[Socket] meeting:join ack:", result);
             if (!result.ok) {
               if (result.reason === "ROOM_FULL") {
@@ -239,7 +309,7 @@ export function useMeeting({ meetingId, displayName, isHostIntent }: Options) {
             setParticipants(result.participants ?? []);
             startTimeRef.current = Date.now();
             console.log(
-              "[Meeting] Joined successfully. Participants:",
+              "[Meeting] Joined. Participants:",
               result.participants?.map((p) => p.name)
             );
           }
@@ -249,13 +319,15 @@ export function useMeeting({ meetingId, displayName, isHostIntent }: Options) {
       socket.on("connect_error", (err) => {
         console.error("[Socket] Connection error:", err.message);
         setConnectionStatus("failed");
-        setError(`Cannot connect to the signaling server (${signalingUrl}). Make sure the backend is running.`);
+        setError(
+          `Cannot connect to the signaling server (${signalingUrl}). Make sure the backend is running.`
+        );
       });
 
       socket.on("disconnect", (reason) => {
         console.warn("[Socket] Disconnected:", reason);
         if (reason !== "io client disconnect") {
-          setError("Disconnected from the server. Attempting to reconnect…");
+          setError("Disconnected from server. Attempting to reconnect…");
         }
       });
 
@@ -264,7 +336,7 @@ export function useMeeting({ meetingId, displayName, isHostIntent }: Options) {
         setError("");
       });
 
-      // ── 4. Meeting / participant events ───────────────────────────────
+      // ── Participant / meeting events ─────────────────────────────────────
 
       socket.on("meeting:participants", (items: Participant[]) => {
         console.log("[Meeting] participants update:", items.map((p) => p.name));
@@ -280,7 +352,8 @@ export function useMeeting({ meetingId, displayName, isHostIntent }: Options) {
       socket.on("participant:joined", (participant: Participant) => {
         console.log("[Meeting] Participant joined:", participant.name, participant.id);
         setParticipants((prev) => upsertParticipant(prev, participant));
-        // Existing participant calls the new one
+        // Existing participant calls the new one — use the ref-captured version
+        // so we always have the latest createPeer/socket available.
         callParticipant(participant.id).catch((e) =>
           console.error("[WebRTC] callParticipant failed:", e)
         );
@@ -314,14 +387,33 @@ export function useMeeting({ meetingId, displayName, isHostIntent }: Options) {
         setChatMessages((prev) => [...prev, message]);
       });
 
-      // ── 5. WebRTC signaling ───────────────────────────────────────────
+      // ── WebRTC signaling ─────────────────────────────────────────────────
 
       socket.on("signal:offer", async ({ from, description }: SignalPayload) => {
         if (!description) return;
         console.log("[WebRTC] Received offer from:", from);
+
+        // Wait for local stream to be ready (it should always be ready by now,
+        // but guard against the rare timing edge case)
+        if (!localStreamRef.current) {
+          console.warn("[WebRTC] Offer arrived before local stream. Waiting…");
+          await new Promise<void>((resolve) => {
+            const check = setInterval(() => {
+              if (localStreamRef.current) {
+                clearInterval(check);
+                resolve();
+              }
+            }, 50);
+            // Timeout after 3s to avoid hanging
+            setTimeout(() => { clearInterval(check); resolve(); }, 3000);
+          });
+        }
+
         const peer = createPeer(from);
         try {
           await peer.setRemoteDescription(description);
+          // Flush any ICE candidates that arrived before this remote description
+          await flushIceQueue(from, peer);
           const answer = await peer.createAnswer();
           await peer.setLocalDescription(answer);
           socket.emit("signal:answer", { to: from, description: answer });
@@ -335,18 +427,36 @@ export function useMeeting({ meetingId, displayName, isHostIntent }: Options) {
         if (!description) return;
         console.log("[WebRTC] Received answer from:", from);
         const peer = peersRef.current.get(from);
-        if (peer && peer.signalingState !== "stable") {
-          try {
-            await peer.setRemoteDescription(description);
-          } catch (e) {
-            console.error("[WebRTC] Failed to set remote description from", from, e);
-          }
+        if (!peer) {
+          console.warn("[WebRTC] Received answer but no peer found for", from);
+          return;
+        }
+        if (peer.signalingState === "stable") {
+          console.warn("[WebRTC] Received answer but peer is already stable for", from);
+          return;
+        }
+        try {
+          await peer.setRemoteDescription(description);
+          // Flush queued ICE candidates
+          await flushIceQueue(from, peer);
+        } catch (e) {
+          console.error("[WebRTC] Failed to set remote description from", from, e);
         }
       });
 
       socket.on("signal:ice-candidate", async ({ from, candidate }: SignalPayload) => {
         if (!candidate) return;
-        const peer = createPeer(from);
+        const peer = peersRef.current.get(from);
+
+        if (!peer || !peer.remoteDescription) {
+          // Peer doesn't exist yet or has no remote description — queue the candidate
+          const queue = iceCandidateQueueRef.current.get(from) ?? [];
+          queue.push(candidate);
+          iceCandidateQueueRef.current.set(from, queue);
+          console.log(`[WebRTC] Queued ICE candidate from ${from} (peer not ready)`);
+          return;
+        }
+
         try {
           await peer.addIceCandidate(candidate);
         } catch (e) {
@@ -359,12 +469,13 @@ export function useMeeting({ meetingId, displayName, isHostIntent }: Options) {
 
     return () => {
       cancelled = true;
-      initialisedRef.current = false;
+      initRunningRef.current = false;
       console.log("[Meeting] Cleanup.");
       socketRef.current?.disconnect();
       socketRef.current = null;
       peersRef.current.forEach((peer) => peer.close());
       peersRef.current.clear();
+      iceCandidateQueueRef.current.clear();
       localStreamRef.current?.getTracks().forEach((t) => t.stop());
       localStreamRef.current = null;
       screenStreamRef.current?.getTracks().forEach((t) => t.stop());
@@ -372,13 +483,14 @@ export function useMeeting({ meetingId, displayName, isHostIntent }: Options) {
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [meetingId, displayName]);
-  // NOTE: intentionally minimal deps — callParticipant/createPeer/cleanupPeer are
-  // stable callbacks but including them causes the effect to re-run and double-init.
-  // The refs they read (localStreamRef, socketRef, peersRef) are always current.
+  // Intentionally minimal deps: meetingId + displayName are the triggers.
+  // callParticipant, createPeer, cleanupPeer, flushIceQueue are stable useCallback refs.
+  // signalingUrl, isHostIntent are read at call time from closure — stable after init.
 
   // ── timer ──────────────────────────────────────────────────────────────────
 
   useEffect(() => {
+    if (!startTimeRef.current) return; // don't start until meeting:join ack
     const interval = window.setInterval(() => {
       const seconds = Math.floor((Date.now() - startTimeRef.current) / 1000);
       const mins = Math.floor(seconds / 60).toString().padStart(2, "0");
@@ -387,6 +499,12 @@ export function useMeeting({ meetingId, displayName, isHostIntent }: Options) {
     }, 1000);
     return () => window.clearInterval(interval);
   }, []);
+
+  // Start the timer once the meeting is joined (localParticipant set)
+  useEffect(() => {
+    if (!localParticipant) return;
+    startTimeRef.current = Date.now();
+  }, [localParticipant]);
 
   // ── actions ────────────────────────────────────────────────────────────────
 
@@ -414,7 +532,10 @@ export function useMeeting({ meetingId, displayName, isHostIntent }: Options) {
       return;
     }
     try {
-      const stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
+      const stream = await navigator.mediaDevices.getDisplayMedia({
+        video: true,
+        audio: true,
+      });
       screenStreamRef.current = stream;
       const [screenTrack] = stream.getVideoTracks();
       replaceVideoTrack(screenTrack);
@@ -556,7 +677,7 @@ export function useMeeting({ meetingId, displayName, isHostIntent }: Options) {
   };
 }
 
-// ── helpers ──────────────────────────────────────────────────────────────────
+// ── module-level helpers ───────────────────────────────────────────────────────
 
 function upsertParticipant(participants: Participant[], participant: Participant) {
   const next = participants.filter((p) => p.id !== participant.id);
