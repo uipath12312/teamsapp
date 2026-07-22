@@ -1,4 +1,5 @@
 import { Meeting, Participant } from "../types.js";
+import { canCreateNewMeeting } from "./adminState.js";
 
 const meetings = new Map<string, Meeting>();
 
@@ -41,6 +42,17 @@ export function canJoin(meeting: Meeting) {
   return !meeting.ended && meeting.participants.size < getMaxParticipants();
 }
 
+/** Check both participant limit and admin-level meeting creation controls. */
+export function canCreateMeeting(): boolean {
+  const active = [...meetings.values()].filter((m) => !m.ended).length;
+  return canCreateNewMeeting(active);
+}
+
+/** Returns total number of active (non-ended) meetings. */
+export function activeMeetingCount(): number {
+  return [...meetings.values()].filter((m) => !m.ended).length;
+}
+
 export function addParticipant(meeting: Meeting, participant: Participant) {
   meeting.participants.set(participant.id, participant);
 }
@@ -78,8 +90,41 @@ export function listMeetings() {
   return [...meetings.values()].map((meeting) => ({
     id: meeting.id,
     participants: meeting.participants.size,
-    createdAt: meeting.createdAt
+    participantNames: [...meeting.participants.values()].map((p) => p.name),
+    createdAt: meeting.createdAt,
+    durationSeconds: Math.floor((Date.now() - meeting.createdAt) / 1000),
+    screenSharing: meeting.screenShareParticipantId !== null,
   }));
+}
+
+/** End every active meeting — called by admin "End All". */
+export function endAllMeetings(): string[] {
+  const ids: string[] = [];
+  for (const [id, meeting] of meetings.entries()) {
+    if (!meeting.ended) {
+      meeting.ended = true;
+      ids.push(id);
+    }
+  }
+  meetings.clear();
+  return ids;
+}
+
+/** Remove meetings that have no participants and are not active. */
+export function clearInactiveMeetings(): number {
+  let count = 0;
+  for (const [id, meeting] of meetings.entries()) {
+    if (meeting.ended || meeting.participants.size === 0) {
+      meetings.delete(id);
+      count++;
+    }
+  }
+  return count;
+}
+
+/** Get a single meeting by ID for admin view. */
+export function getMeetingById(meetingId: string): Meeting | null {
+  return meetings.get(meetingId) ?? null;
 }
 
 // Exported so the health endpoint can report the current configured limit

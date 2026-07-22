@@ -3,12 +3,14 @@ import { ChatPayload, JoinPayload, Participant } from "../types.js";
 import {
   addParticipant,
   canJoin,
+  canCreateMeeting,
   endMeeting,
   getMeeting,
   getOrCreateMeeting,
   removeParticipant,
   serializeParticipants
 } from "../utils/meetings.js";
+import { getAdminState } from "../utils/adminState.js";
 
 type ServerSideSocket = Socket & {
   data: {
@@ -29,6 +31,20 @@ export function registerMeetingSocket(io: Server) {
       }
 
       const existing = getMeeting(meetingId);
+
+      // Maintenance mode — no new meetings
+      const adminState = getAdminState();
+      if (adminState.maintenanceMode && !existing) {
+        ack?.({ ok: false, reason: "MAINTENANCE" });
+        return;
+      }
+
+      // Parallel meeting limit — only blocks creation of brand-new meetings
+      if (!existing && !canCreateMeeting()) {
+        ack?.({ ok: false, reason: "MAX_MEETINGS_REACHED" });
+        return;
+      }
+
       const meeting = existing ?? getOrCreateMeeting(meetingId, socket.id);
 
       if (!canJoin(meeting)) {

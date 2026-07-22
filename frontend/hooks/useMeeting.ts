@@ -285,7 +285,13 @@ export function useMeeting({ meetingId, displayName, isHostIntent }: Options) {
             if (cancelled) return;
             console.log("[Socket] meeting:join ack:", JSON.stringify(result));
             if (!result.ok) {
-              setError(result.reason === "ROOM_FULL" ? "This meeting is full." : result.reason === "ENDED" ? "This meeting has ended." : "Unable to join. Please try again.");
+              setError(
+                result.reason === "ROOM_FULL" ? "This meeting is full." :
+                result.reason === "ENDED" ? "This meeting has ended." :
+                result.reason === "MAX_MEETINGS_REACHED" ? "Maximum number of active meetings has been reached. Please try again later." :
+                result.reason === "MAINTENANCE" ? "The application is currently under maintenance. Please try again later." :
+                "Unable to join. Please try again."
+              );
               return;
             }
             setLocalParticipant(result.participant ?? null);

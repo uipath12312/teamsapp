@@ -23,7 +23,7 @@ export type RemoteStream = {
 
 export type JoinResult = {
   ok: boolean;
-  reason?: "ROOM_FULL" | "ENDED" | "INVALID_NAME";
+  reason?: "ROOM_FULL" | "ENDED" | "INVALID_NAME" | "MAX_MEETINGS_REACHED" | "MAINTENANCE";
   participant?: Participant;
   participants?: Participant[];
 };
