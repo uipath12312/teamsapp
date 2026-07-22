@@ -1,5 +1,5 @@
 import { Mic, MicOff, MonitorUp, VideoOff } from "lucide-react";
-import { useCallback, useEffect, useRef } from "react";
+import { useEffect, useRef } from "react";
 import { Participant } from "@/types/meeting";
 
 type Props = {
@@ -12,52 +12,51 @@ type Props = {
 export function VideoTile({ participant, stream, isLocal, isScreenShare }: Props) {
   const videoRef = useRef<HTMLVideoElement>(null);
 
-  // Attach stream to video element whenever stream changes OR element mounts
-  const attachStream = useCallback(
-    (el: HTMLVideoElement | null) => {
-      if (!el) return;
-      if (stream && el.srcObject !== stream) {
-        el.srcObject = stream;
-        el.play().catch(() => {
-          // autoplay may be blocked — will recover on user interaction
-        });
-      } else if (!stream) {
-        el.srcObject = null;
-      }
-    },
-    [stream]
-  );
-
-  // ref callback: fires when element mounts/unmounts
-  const videoCallbackRef = useCallback(
-    (el: HTMLVideoElement | null) => {
-      (videoRef as React.MutableRefObject<HTMLVideoElement | null>).current = el;
-      attachStream(el);
-    },
-    [attachStream]
-  );
-
-  // also re-attach whenever stream reference changes on an already-mounted element
   useEffect(() => {
-    attachStream(videoRef.current);
-  }, [attachStream, stream]);
+    const el = videoRef.current;
+    if (!el) return;
+
+    if (stream) {
+      // Only reassign if the stream has changed
+      if (el.srcObject !== stream) {
+        console.log(
+          "[VideoTile] Attaching stream to video element for",
+          participant?.name ?? "unknown",
+          "tracks:", stream.getTracks().map((t) => `${t.kind}(${t.readyState})`)
+        );
+        el.srcObject = stream;
+      }
+      // Always try to play — handles cases where autoplay was blocked
+      el.play().catch((err) => {
+        // NotAllowedError = autoplay blocked — user interaction will unblock
+        if (err.name !== "AbortError") {
+          console.warn("[VideoTile] play() failed:", err.name, err.message);
+        }
+      });
+    } else {
+      el.srcObject = null;
+    }
+  }, [stream, participant?.name]);
 
   const cameraOn = participant?.cameraOn ?? true;
   const micOn = participant?.micOn ?? true;
-  const showVideo = Boolean(stream) && cameraOn;
+  // Show video element if we have a stream, regardless of cameraOn state
+  // (cameraOn=false just disables the track but the element stays)
+  const hasStream = Boolean(stream);
+  const showVideo = hasStream && cameraOn;
 
   return (
     <article className="relative min-h-[180px] overflow-hidden rounded-lg border border-white/10 bg-[#11141d]">
-      {/* Video element is always in the DOM so srcObject can be set immediately */}
+      {/* Video element always rendered — srcObject attached via useEffect */}
       <video
-        ref={videoCallbackRef}
+        ref={videoRef}
         autoPlay
         playsInline
         muted={isLocal}
-        className={`h-full w-full object-cover transition-opacity duration-200 ${showVideo ? "opacity-100" : "opacity-0 absolute inset-0"}`}
+        className={`h-full w-full object-cover ${showVideo ? "block" : "hidden"}`}
       />
 
-      {/* Avatar shown when camera is off or stream not yet available */}
+      {/* Avatar when camera is off or no stream yet */}
       {!showVideo && (
         <div className="grid h-full min-h-[180px] place-items-center">
           <div className="grid h-20 w-20 place-items-center rounded-full bg-call text-2xl font-semibold text-white select-none">
