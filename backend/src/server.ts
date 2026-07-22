@@ -5,7 +5,7 @@ import helmet from "helmet";
 import { createServer } from "node:http";
 import { Server } from "socket.io";
 import { registerMeetingSocket } from "./socket/meetingSocket.js";
-import { listMeetings } from "./utils/meetings.js";
+import { listMeetings, getMaxParticipantsConfig } from "./utils/meetings.js";
 
 const port = Number(process.env.PORT || 4000);
 
@@ -45,7 +45,7 @@ app.get("/health", (_req: Request, res: Response) => {
   res.json({
     ok: true,
     uptime: process.uptime(),
-    maxParticipants: Number(process.env.MAX_PARTICIPANTS || 10),
+    maxParticipants: getMaxParticipantsConfig(),
     allowedOrigins,
   });
 });
