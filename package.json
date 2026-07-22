@@ -1,0 +1,20 @@
+{
+  "name": "guest-video-meet",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Guest-only WebRTC group video conferencing app for up to five participants.",
+  "scripts": {
+    "dev": "npm run dev --workspace frontend",
+    "dev:frontend": "next dev -H 0.0.0.0 -p 3000",
+    "dev:backend": "npm run dev --workspace backend",
+    "build": "npm run build --workspace frontend && npm run build --workspace backend",
+    "lint": "npm run lint --workspace frontend && npm run lint --workspace backend"
+  },
+  "workspaces": [
+    "frontend",
+    "backend"
+  ],
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

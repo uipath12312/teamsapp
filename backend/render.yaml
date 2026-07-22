@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: guest-video-meet-backend
+    env: node
+    plan: free
+    region: oregon
+    buildCommand: npm install && npm run build
+    startCommand: npm start
+    envVars:
+      - key: PORT
+        value: "10000"
+      - key: CLIENT_ORIGIN
+        generateValue: false
+      - key: MAX_PARTICIPANTS
+        value: "10"
+      - key: MEETING_TTL_MINUTES
+        value: "360"
