@@ -2,8 +2,5 @@
   "framework": "nextjs",
   "buildCommand": "npm run build",
   "installCommand": "npm install",
-  "env": {
-    "NEXT_PUBLIC_SIGNALING_URL": "@next_public_signaling_url",
-    "NEXT_PUBLIC_APP_URL": "@next_public_app_url"
-  }
+  "outputDirectory": ".next"
 }
