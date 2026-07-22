@@ -1,6 +1,6 @@
 import "dotenv/config";
 import cors from "cors";
-import express from "express";
+import express, { Request, Response } from "express";
 import helmet from "helmet";
 import { createServer } from "node:http";
 import { Server } from "socket.io";
@@ -41,7 +41,7 @@ app.use(cors(corsOptions));
 app.options("*", cors(corsOptions));
 app.use(express.json());
 
-app.get("/health", (_req, res) => {
+app.get("/health", (_req: Request, res: Response) => {
   res.json({
     ok: true,
     uptime: process.uptime(),
@@ -50,7 +50,7 @@ app.get("/health", (_req, res) => {
   });
 });
 
-app.get("/meetings", (_req, res) => {
+app.get("/meetings", (_req: Request, res: Response) => {
   res.json({ meetings: listMeetings() });
 });
 
