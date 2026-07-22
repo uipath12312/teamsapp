@@ -1,17 +1,20 @@
 services:
   - type: web
-    name: guest-video-meet-backend
+    name: teamsapp-backend
     env: node
     plan: free
     region: oregon
+    rootDir: backend
     buildCommand: npm install && npm run build
     startCommand: npm start
     envVars:
       - key: PORT
         value: "10000"
       - key: CLIENT_ORIGIN
-        generateValue: false
+        value: "https://teamsapp-frontend.vercel.app"
       - key: MAX_PARTICIPANTS
         value: "10"
       - key: MEETING_TTL_MINUTES
         value: "360"
+      - key: NODE_ENV
+        value: "production"
