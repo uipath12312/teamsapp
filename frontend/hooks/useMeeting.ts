@@ -18,56 +18,73 @@ type SignalPayload = {
 
 const rtcConfig: RTCConfiguration = {
   iceServers: [
+    // Google STUN — fast, always available
     { urls: "stun:stun.l.google.com:19302" },
     { urls: "stun:stun1.l.google.com:19302" },
     { urls: "stun:stun2.l.google.com:19302" },
-    { urls: "stun:stun3.l.google.com:19302" },
-    { urls: "stun:stun4.l.google.com:19302" },
-    { urls: "turn:openrelay.metered.ca:80",    username: "openrelayproject", credential: "openrelayproject" },
-    { urls: "turn:openrelay.metered.ca:443",   username: "openrelayproject", credential: "openrelayproject" },
+    // Free TURN via Metered (more reliable than openrelay, 50 GB/month free)
+    // These credentials are public/shared — fine for small meetings
+    { urls: "turn:a.relay.metered.ca:80",     username: "free",    credential: "free" },
+    { urls: "turn:a.relay.metered.ca:80?transport=tcp", username: "free", credential: "free" },
+    { urls: "turn:a.relay.metered.ca:443",    username: "free",    credential: "free" },
+    { urls: "turns:a.relay.metered.ca:443",   username: "free",    credential: "free" },
+    // Fallback: Open Relay (kept as secondary)
+    { urls: "turn:openrelay.metered.ca:443",  username: "openrelayproject", credential: "openrelayproject" },
     { urls: "turn:openrelay.metered.ca:443?transport=tcp", username: "openrelayproject", credential: "openrelayproject" },
   ],
   iceCandidatePoolSize: 10,
+  bundlePolicy: "max-bundle",  // bundle all media onto one transport — reduces ICE complexity
+  rtcpMuxPolicy: "require",    // require RTCP mux — modern browsers all support this
 };
 
 /**
- * Try to get camera+mic, fall back gracefully so the meeting is NEVER blocked.
- * Returns: { stream, hasVideo, hasAudio }
+ * Acquire local media with graceful fallbacks.
+ * Priority: audio > video > nothing. Meeting is NEVER blocked.
+ * Tries audio first (fastest, most important), then adds video.
  */
 async function acquireMedia(): Promise<{ stream: MediaStream; hasVideo: boolean; hasAudio: boolean }> {
-  // Attempt 1: camera + microphone
+  let audioTrack: MediaStreamTrack | null = null;
+  let videoTrack: MediaStreamTrack | null = null;
+
+  // Step 1: Always try audio first — it's the highest priority
   try {
-    const stream = await navigator.mediaDevices.getUserMedia({
+    const audioStream = await navigator.mediaDevices.getUserMedia({
       audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      video: false,
+    });
+    audioTrack = audioStream.getAudioTracks()[0] ?? null;
+    console.log("[Media] Audio track acquired:", audioTrack?.label);
+  } catch (e) {
+    console.warn("[Media] Audio unavailable:", (e as Error).name);
+  }
+
+  // Step 2: Try video separately — don't let video failure block audio
+  try {
+    const videoStream = await navigator.mediaDevices.getUserMedia({
+      audio: false,
       video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: "user" },
     });
-    console.log("[Media] Camera + microphone granted.");
-    return { stream, hasVideo: true, hasAudio: true };
-  } catch (e1) {
-    console.warn("[Media] Camera+mic failed:", (e1 as Error).name, "— trying audio only");
+    videoTrack = videoStream.getVideoTracks()[0] ?? null;
+    console.log("[Media] Video track acquired:", videoTrack?.label);
+  } catch (e) {
+    console.warn("[Media] Video unavailable:", (e as Error).name);
   }
 
-  // Attempt 2: microphone only
-  try {
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
-    console.log("[Media] Microphone-only granted.");
-    return { stream, hasVideo: false, hasAudio: true };
-  } catch (e2) {
-    console.warn("[Media] Audio-only failed:", (e2 as Error).name, "— trying video only");
+  // Build a combined stream from whatever we got
+  const stream = new MediaStream();
+  if (audioTrack) stream.addTrack(audioTrack);
+  if (videoTrack) stream.addTrack(videoTrack);
+
+  const hasAudio = audioTrack !== null;
+  const hasVideo = videoTrack !== null;
+
+  if (!hasAudio && !hasVideo) {
+    console.warn("[Media] No media available — joining without camera or microphone.");
+  } else {
+    console.log("[Media] Ready. audio:", hasAudio, "video:", hasVideo);
   }
 
-  // Attempt 3: camera only
-  try {
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: false, video: true });
-    console.log("[Media] Camera-only granted.");
-    return { stream, hasVideo: true, hasAudio: false };
-  } catch (e3) {
-    console.warn("[Media] Video-only failed:", (e3 as Error).name, "— joining with no media");
-  }
-
-  // Attempt 4: no media — join anyway with empty stream
-  console.warn("[Media] No media available. Joining meeting without camera or microphone.");
-  return { stream: new MediaStream(), hasVideo: false, hasAudio: false };
+  return { stream, hasVideo, hasAudio };
 }
 
 export function useMeeting({ meetingId, displayName, isHostIntent }: Options) {
@@ -121,19 +138,29 @@ export function useMeeting({ meetingId, displayName, isHostIntent }: Options) {
    */
   const replaceTrackInPeers = useCallback(async (kind: "video" | "audio", track: MediaStreamTrack | null) => {
     const promises = Array.from(peersRef.current.entries()).map(async ([id, peer]) => {
-      const sender = peer.getSenders().find((s) => s.track?.kind === kind || (track && s.track === null && kind === "video"));
+      // Find an existing sender for this track kind (including null/stopped tracks)
+      const sender = peer.getSenders().find((s) => {
+        if (s.track?.kind === kind) return true;
+        if (s.track === null) {
+          // A null-track sender exists — check if it was originally for this kind
+          // by checking if we can match via the track kind we're replacing
+          return kind === "video"; // null senders are almost always video after stop()
+        }
+        return false;
+      });
+
       if (sender) {
         try {
           await sender.replaceTrack(track);
-          console.log(`[WebRTC] Replaced ${kind} track in peer ${id}`);
+          console.log(`[WebRTC] replaceTrack(${kind}) in peer ${id}: ${track?.kind ?? "null"}`);
         } catch (e) {
           console.error(`[WebRTC] replaceTrack(${kind}) failed for ${id}:`, e);
         }
       } else if (track && localStreamRef.current) {
-        // No sender for this kind yet — add a new track
+        // No sender at all for this kind — add a brand new track
         try {
           peer.addTrack(track, localStreamRef.current);
-          console.log(`[WebRTC] Added new ${kind} track to peer ${id}`);
+          console.log(`[WebRTC] addTrack(${kind}) to peer ${id} (no prior sender)`);
         } catch (e) {
           console.error(`[WebRTC] addTrack(${kind}) failed for ${id}:`, e);
         }
@@ -185,15 +212,35 @@ export function useMeeting({ meetingId, displayName, isHostIntent }: Options) {
     peer.oniceconnectionstatechange = () => {
       console.log("[WebRTC] ICE connection:", participantId, peer.iceConnectionState);
       if (peer.iceConnectionState === "failed") {
-        console.warn("[WebRTC] ICE failed — restarting:", participantId);
-        peer.restartIce();
+        console.warn("[WebRTC] ICE failed — attempting ICE restart for:", participantId);
+        // restartIce() alone isn't enough — we need to re-offer with iceRestart:true
+        const socket = socketRef.current;
+        if (socket && peer.signalingState === "stable") {
+          peer.createOffer({ iceRestart: true })
+            .then((offer) => peer.setLocalDescription(offer))
+            .then(() => {
+              socket.emit("signal:offer", { to: participantId, description: peer.localDescription });
+              console.log("[WebRTC] ICE restart offer sent to:", participantId);
+            })
+            .catch((e) => console.error("[WebRTC] ICE restart failed:", e));
+        }
       }
     };
 
     peer.onconnectionstatechange = () => {
       console.log("[WebRTC] Connection state:", participantId, peer.connectionState);
-      if (peer.connectionState === "failed" || peer.connectionState === "closed") {
-        cleanupPeer(participantId);
+      // Only clean up on truly terminal states.
+      // "closed" can fire after we already called peer.close() — guard against double cleanup.
+      if (peer.connectionState === "failed") {
+        console.warn("[WebRTC] Connection permanently failed for:", participantId);
+        // Don't clean up immediately on failed — ICE restart may recover it.
+        // Only clean up if already closed.
+      }
+      if (peer.connectionState === "closed") {
+        // Only clean up if this peer is still tracked (avoid double cleanup)
+        if (peersRef.current.get(participantId) === peer) {
+          cleanupPeer(participantId);
+        }
       }
     };
 
@@ -229,9 +276,12 @@ export function useMeeting({ meetingId, displayName, isHostIntent }: Options) {
     console.log("[WebRTC] Calling:", participantId);
     const peer = createPeer(participantId);
     try {
-      const offer = await peer.createOffer({ offerToReceiveAudio: true, offerToReceiveVideo: true });
+      const offer = await peer.createOffer({
+        offerToReceiveAudio: true,
+        offerToReceiveVideo: true,
+      });
       await peer.setLocalDescription(offer);
-      socket.emit("signal:offer", { to: participantId, description: offer });
+      socket.emit("signal:offer", { to: participantId, description: peer.localDescription });
       console.log("[WebRTC] Offer sent to:", participantId);
     } catch (e) {
       console.error("[WebRTC] createOffer failed:", participantId, e);
@@ -345,7 +395,7 @@ export function useMeeting({ meetingId, displayName, isHostIntent }: Options) {
           await flushIceQueue(from, peer);
           const answer = await peer.createAnswer();
           await peer.setLocalDescription(answer);
-          socket.emit("signal:answer", { to: from, description: answer });
+          socket.emit("signal:answer", { to: from, description: peer.localDescription });
           console.log("[WebRTC] Answer sent to:", from);
         } catch (e) { console.error("[WebRTC] offer handling failed:", from, e); }
       });
@@ -353,10 +403,19 @@ export function useMeeting({ meetingId, displayName, isHostIntent }: Options) {
       socket.on("signal:answer", async ({ from, description }: SignalPayload) => {
         if (!description) return;
         const peer = peersRef.current.get(from);
-        if (!peer || peer.signalingState === "stable") return;
+        if (!peer) {
+          console.warn("[WebRTC] No peer for answer from:", from);
+          return;
+        }
+        // Accept answer in have-local-offer state OR when doing ICE restart (stable→have-local-offer)
+        if (peer.signalingState !== "have-local-offer") {
+          console.warn("[WebRTC] Unexpected signaling state for answer from", from, ":", peer.signalingState);
+          return;
+        }
         try {
           await peer.setRemoteDescription(new RTCSessionDescription(description));
           await flushIceQueue(from, peer);
+          console.log("[WebRTC] Answer applied from:", from);
         } catch (e) { console.error("[WebRTC] answer handling failed:", from, e); }
       });
 
